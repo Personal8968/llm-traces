@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-${{ github.ref }}
+
+permissions:
+  contents: write
+
+jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Package & Release
+    needs: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            plugin.json
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: plugin-dist
+          path: dist/
+
+      - name: Package plugin
+        run: |
+          PLUGIN_ID=$(node -p "require('./plugin.json').id")
+          VERSION="${GITHUB_REF_NAME#v}"
+          cp -r dist "${PLUGIN_ID}"
+          zip -r "${PLUGIN_ID}-${VERSION}.zip" "${PLUGIN_ID}/"
+          sha256sum "${PLUGIN_ID}-${VERSION}.zip" > "${PLUGIN_ID}-${VERSION}.zip.sha256"
+          echo "ZIP_NAME=${PLUGIN_ID}-${VERSION}.zip" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ZIP_NAME }}
+            ${{ env.ZIP_NAME }}.sha256
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

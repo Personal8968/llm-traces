@@ -1,0 +1,1593 @@
+// Unit tests for llmUtils.ts
+// Run with: node --experimental-strip-types tests/llmUtils.unit.test.ts
+
+import {
+  extractLlmSpanData,
+  isLlmSpan,
+  isEmbeddingSpan,
+  type KeyValuePair,
+  type SpanLog,
+} from '../src/utils/llmUtils.ts';
+
+// ---------------------------------------------------------------------------
+// Minimal assertion helpers
+// ---------------------------------------------------------------------------
+
+let passed = 0;
+let failed = 0;
+
+function assert(condition: boolean, message: string): void {
+  if (!condition) {
+    console.error(`  FAIL: ${message}`);
+    failed++;
+  } else {
+    console.log(`  pass: ${message}`);
+    passed++;
+  }
+}
+
+function assertEquals<T>(actual: T, expected: T, message: string): void {
+  if (actual !== expected) {
+    console.error(`  FAIL: ${message} — expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    failed++;
+  } else {
+    console.log(`  pass: ${message}`);
+    passed++;
+  }
+}
+
+function assertDeepEquals(actual: unknown, expected: unknown, message: string): void {
+  const a = JSON.stringify(actual);
+  const b = JSON.stringify(expected);
+  if (a !== b) {
+    console.error(`  FAIL: ${message}\n    expected: ${b}\n    got:      ${a}`);
+    failed++;
+  } else {
+    console.log(`  pass: ${message}`);
+    passed++;
+  }
+}
+
+function describe(name: string, fn: () => void): void {
+  console.log(`\n=== ${name} ===`);
+  fn();
+}
+
+// ---------------------------------------------------------------------------
+// Helper builders
+// ---------------------------------------------------------------------------
+
+function kv(key: string, value: unknown): KeyValuePair {
+  return { key, value };
+}
+
+function log(name: string, fields: KeyValuePair[], timestamp = 0): SpanLog {
+  return { timestamp, name, fields };
+}
+
+// ---------------------------------------------------------------------------
+// 1. extractLlmSpanData — OpenInference attributes
+// ---------------------------------------------------------------------------
+
+describe('extractLlmSpanData — OpenInference convention', () => {
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'LLM'),
+    kv('llm.model_name', 'gpt-4o'),
+    kv('llm.system', 'openai'),
+    kv('llm.invocation_parameters', '{"temperature":0.7,"max_tokens":512}'),
+    kv('llm.input_messages.0.message.role', 'system'),
+    kv('llm.input_messages.0.message.content', 'You are a helpful assistant.'),
+    kv('llm.input_messages.1.message.role', 'user'),
+    kv('llm.input_messages.1.message.content', 'Hello!'),
+    kv('llm.output_messages.0.message.role', 'assistant'),
+    kv('llm.output_messages.0.message.content', 'Hi there!'),
+    kv('llm.output_messages.0.message.finish_reason', 'stop'),
+    kv('llm.token_count.prompt', 20),
+    kv('llm.token_count.completion', 10),
+    kv('llm.token_count.total', 30),
+  ];
+
+  const result = extractLlmSpanData(tags, []);
+
+  assertEquals(result.isLlm, true, 'isLlm is true for LLM kind');
+  assertEquals(result.convention, 'openinference', 'convention = openinference');
+  assertEquals(result.model, 'gpt-4o', 'model extracted');
+  assertEquals(result.system, 'openai', 'system extracted from llm.system');
+  assertEquals(result.spanKind, 'LLM', 'spanKind = LLM');
+  assertEquals(result.inputMessages.length, 2, 'two input messages');
+  assertEquals(result.inputMessages[0].role, 'system', 'first input role = system');
+  assertEquals(result.inputMessages[0].content, 'You are a helpful assistant.', 'system content');
+  assertEquals(result.inputMessages[1].role, 'user', 'second input role = user');
+  assertEquals(result.outputMessages.length, 1, 'one output message');
+  assertEquals(result.outputMessages[0].role, 'assistant', 'output role = assistant');
+  assertEquals(result.outputMessages[0].content, 'Hi there!', 'output content');
+  assertEquals(result.tokenUsage.input, 20, 'token input = 20');
+  assertEquals(result.tokenUsage.output, 10, 'token output = 10');
+  assertEquals(result.tokenUsage.total, 30, 'token total = 30');
+  assertEquals(result.finishReason, 'stop', 'finishReason from output finish_reason');
+  assertEquals((result.invocationParams as any).temperature, 0.7, 'temperature from invocation_parameters');
+  assertEquals((result.invocationParams as any).max_tokens, 512, 'max_tokens from invocation_parameters');
+});
+
+describe('extractLlmSpanData — OpenInference CHAIN span is NOT isLlm', () => {
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'CHAIN'),
+    kv('llm.model_name', 'gpt-4o'),
+    kv('input.value', 'some question'),
+    kv('output.value', 'some answer'),
+  ];
+
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.isLlm, false, 'CHAIN span isLlm = false');
+  assertEquals(result.convention, 'openinference', 'convention still openinference');
+  assertEquals(result.spanKind, 'CHAIN', 'spanKind = CHAIN');
+});
+
+describe('extractLlmSpanData — OpenInference with tool_calls in output', () => {
+  const toolCallsJson = JSON.stringify([
+    { id: 'call_abc', function: { name: 'search', arguments: '{"q":"hotels"}' } },
+  ]);
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'LLM'),
+    kv('llm.model_name', 'gpt-4o'),
+    kv('llm.input_messages.0.message.role', 'user'),
+    kv('llm.input_messages.0.message.content', 'Find hotels'),
+    kv('llm.output_messages.0.message.role', 'assistant'),
+    kv('llm.output_messages.0.message.content', ''),
+    kv('llm.output_messages.0.message.tool_calls', toolCallsJson),
+    kv('llm.token_count.prompt', 15),
+    kv('llm.token_count.completion', 5),
+    kv('llm.token_count.total', 20),
+  ];
+
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.isLlm, true, 'isLlm = true');
+  assert(Array.isArray(result.outputMessages[0].toolCalls), 'tool calls parsed as array');
+  assertEquals(result.outputMessages[0].toolCalls?.length, 1, 'one tool call');
+  assertEquals(result.outputMessages[0].toolCalls?.[0].name, 'search', 'tool call name = search');
+  assertEquals(result.outputMessages[0].toolCalls?.[0].id, 'call_abc', 'tool call id preserved');
+});
+
+// ---------------------------------------------------------------------------
+// 2. extractLlmSpanData — OTel gen_ai attributes
+// ---------------------------------------------------------------------------
+
+describe('extractLlmSpanData — OTel gen_ai convention (from span events)', () => {
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'openai'),
+    kv('gen_ai.request.model', 'gpt-4o-mini'),
+    kv('gen_ai.usage.input_tokens', 100),
+    kv('gen_ai.usage.output_tokens', 50),
+    kv('gen_ai.request.temperature', 0.5),
+    kv('gen_ai.request.max_tokens', 256),
+  ];
+
+  const logs: SpanLog[] = [
+    log('gen_ai.content.prompt', [
+      kv('gen_ai.prompt', JSON.stringify([{ role: 'user', content: 'What is AI?' }])),
+    ]),
+    log('gen_ai.content.completion', [
+      kv('gen_ai.completion', 'Artificial Intelligence is...'),
+    ]),
+  ];
+
+  const result = extractLlmSpanData(tags, logs);
+
+  assertEquals(result.isLlm, true, 'otel-genai isLlm = true');
+  assertEquals(result.convention, 'otel-genai', 'convention = otel-genai');
+  assertEquals(result.model, 'gpt-4o-mini', 'model from gen_ai.request.model');
+  assertEquals(result.system, 'openai', 'system from gen_ai.system');
+  assertEquals(result.tokenUsage.input, 100, 'input tokens');
+  assertEquals(result.tokenUsage.output, 50, 'output tokens');
+  assertEquals(result.inputMessages.length, 1, 'one input message from event');
+  assertEquals(result.inputMessages[0].role, 'user', 'input message role');
+  assertEquals(result.inputMessages[0].content, 'What is AI?', 'input message content');
+  assertEquals(result.outputMessages.length, 1, 'one output message');
+  assertEquals(result.outputMessages[0].content, 'Artificial Intelligence is...', 'output content');
+  assertEquals(result.invocationParams.temperature, 0.5, 'temperature');
+  assertEquals(result.invocationParams.maxTokens, 256, 'maxTokens');
+});
+
+describe('extractLlmSpanData — OTel gen_ai with plain text completion event', () => {
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'anthropic'),
+    kv('gen_ai.request.model', 'claude-3-haiku'),
+  ];
+
+  const logs: SpanLog[] = [
+    log('gen_ai.content.prompt', [
+      kv('gen_ai.prompt', 'Translate: Hello'),
+    ]),
+    log('gen_ai.content.completion', [
+      kv('gen_ai.completion', 'Hola'),
+    ]),
+  ];
+
+  const result = extractLlmSpanData(tags, logs);
+
+  assertEquals(result.convention, 'otel-genai', 'convention = otel-genai');
+  assertEquals(result.inputMessages[0].content, 'Translate: Hello', 'plain text prompt stored');
+  assertEquals(result.inputMessages[0].role, 'user', 'default role = user');
+  assertEquals(result.outputMessages[0].content, 'Hola', 'plain text completion stored');
+  assertEquals(result.outputMessages[0].role, 'assistant', 'output role = assistant');
+});
+
+describe('extractLlmSpanData — OTel gen_ai system message event', () => {
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'openai'),
+    kv('gen_ai.request.model', 'gpt-4o'),
+  ];
+
+  const logs: SpanLog[] = [
+    log('gen_ai.system.message', [
+      kv('gen_ai.content', 'You are a concise assistant.'),
+    ]),
+    log('gen_ai.content.prompt', [
+      kv('gen_ai.prompt', 'Summarize this.'),
+    ]),
+    log('gen_ai.content.completion', [
+      kv('gen_ai.completion', 'A summary.'),
+    ]),
+  ];
+
+  const result = extractLlmSpanData(tags, logs);
+
+  assertEquals(result.inputMessages.length, 2, 'system + user = 2 messages');
+  assertEquals(result.inputMessages[0].role, 'system', 'system message first');
+  assertEquals(result.inputMessages[0].content, 'You are a concise assistant.', 'system content');
+  assertEquals(result.inputMessages[1].role, 'user', 'user message second');
+});
+
+describe('extractLlmSpanData — OTel gen_ai finish reason', () => {
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'openai'),
+    kv('gen_ai.request.model', 'gpt-4'),
+    kv('gen_ai.response.finish_reasons.0', 'length'),
+  ];
+
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.finishReason, 'length', 'finishReason from gen_ai.response.finish_reasons.0');
+});
+
+// ---------------------------------------------------------------------------
+// 3. extractLlmSpanData — GCP Vertex / vertex convention
+// ---------------------------------------------------------------------------
+
+describe('extractLlmSpanData — Vertex AI via gen_ai.system=vertex_ai', () => {
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'vertex_ai'),
+    kv('gen_ai.request.model', 'gemini-1.5-pro'),
+    kv('llm.prompts.0.role', 'user'),
+    kv('llm.prompts.0.content', 'Describe the Eiffel Tower.'),
+    kv('llm.completions.0.role', 'model'),
+    kv('llm.completions.0.content', 'The Eiffel Tower is a landmark in Paris.'),
+    kv('llm.token_count.prompt', 12),
+    kv('llm.token_count.completion', 20),
+    kv('llm.token_count.total', 32),
+  ];
+
+  const result = extractLlmSpanData(tags, []);
+
+  // detectConvention returns 'vertex' and extractLlmSpanData preserves it.
+  assertEquals(result.convention, 'vertex', 'convention = vertex for vertex_ai system');
+  assertEquals(result.isLlm, true, 'vertex isLlm = true');
+  assertEquals(result.model, 'gemini-1.5-pro', 'model from gen_ai.request.model');
+  assertEquals(result.system, 'vertex_ai', 'system = vertex_ai');
+  assertEquals(result.tokenUsage.input, 12, 'prompt tokens');
+  assertEquals(result.tokenUsage.output, 20, 'completion tokens');
+  assertEquals(result.tokenUsage.total, 32, 'total tokens');
+});
+
+describe('extractLlmSpanData — Vertex AI via llm.prompts prefix (no gen_ai.system)', () => {
+  const tags: KeyValuePair[] = [
+    kv('llm.prompts.0.role', 'user'),
+    kv('llm.prompts.0.content', 'Hello from vertex'),
+    kv('llm.completions.0.role', 'model'),
+    kv('llm.completions.0.content', 'Hello back'),
+  ];
+
+  const result = extractLlmSpanData(tags, []);
+  // detectConvention returns 'vertex' and extractLlmSpanData preserves it.
+  assertEquals(result.convention, 'vertex', 'convention = vertex for llm.prompts prefix');
+  assertEquals(result.isLlm, true, 'vertex isLlm = true');
+});
+
+// ---------------------------------------------------------------------------
+// 4. extractLlmSpanData — generic/unknown attributes
+// ---------------------------------------------------------------------------
+
+describe('extractLlmSpanData — generic convention (operation.type=completion)', () => {
+  const messagesJson = JSON.stringify([
+    { role: 'user', content: 'Generic question' },
+  ]);
+  const tags: KeyValuePair[] = [
+    kv('operation.type', 'chat_completion'),
+    kv('model', 'my-custom-model'),
+    kv('input.value', messagesJson),
+    kv('temperature', 0.9),
+    kv('max_tokens', 100),
+    kv('prompt_tokens', 25),
+    kv('completion_tokens', 15),
+    kv('total_tokens', 40),
+  ];
+
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.convention, 'generic', 'convention = generic');
+  assertEquals(result.isLlm, true, 'generic isLlm = true');
+  assertEquals(result.model, 'my-custom-model', 'model from model attr');
+  assertEquals(result.tokenUsage.input, 25, 'prompt_tokens');
+  assertEquals(result.tokenUsage.output, 15, 'completion_tokens');
+  assertEquals(result.tokenUsage.total, 40, 'total_tokens');
+  assertEquals(result.invocationParams.temperature, 0.9, 'temperature from generic tag');
+  assertEquals(result.invocationParams.maxTokens, 100, 'maxTokens from generic tag');
+  assertEquals(result.inputMessages.length, 1, 'input message from JSON input.value');
+  assertEquals(result.inputMessages[0].role, 'user', 'user role in generic input');
+});
+
+describe('extractLlmSpanData — unknown (no LLM markers)', () => {
+  const tags: KeyValuePair[] = [
+    kv('http.method', 'GET'),
+    kv('http.url', '/api/users'),
+    kv('http.status_code', 200),
+  ];
+
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.isLlm, false, 'non-LLM span isLlm = false');
+  assertEquals(result.convention, 'unknown', 'convention = unknown');
+  assertEquals(result.model, '', 'model empty for unknown');
+  assertEquals(result.inputMessages.length, 0, 'no input messages');
+  assertEquals(result.outputMessages.length, 0, 'no output messages');
+});
+
+describe('extractLlmSpanData — generic with operationName fallback', () => {
+  const msgJson = JSON.stringify([{ role: 'user', content: 'test' }]);
+  const tags: KeyValuePair[] = [
+    kv('operation.type', 'chat_completion'),
+    kv('input.value', msgJson),
+  ];
+
+  const result = extractLlmSpanData(tags, [], 'my-llm-op');
+  assertEquals(result.model, 'my-llm-op', 'model falls back to operationName');
+});
+
+// ---------------------------------------------------------------------------
+// 5. isLlmSpan — various attribute combinations
+// ---------------------------------------------------------------------------
+
+describe('isLlmSpan — openinference.span.kind=LLM', () => {
+  assert(isLlmSpan([kv('openinference.span.kind', 'LLM')]), 'kind=LLM is LLM span');
+  assert(!isLlmSpan([kv('openinference.span.kind', 'CHAIN')]), 'kind=CHAIN is NOT LLM span');
+  assert(!isLlmSpan([kv('openinference.span.kind', 'TOOL')]), 'kind=TOOL is NOT LLM span');
+  assert(!isLlmSpan([kv('openinference.span.kind', 'RETRIEVER')]), 'kind=RETRIEVER is NOT LLM span');
+  assert(!isLlmSpan([kv('openinference.span.kind', 'EMBEDDING')]), 'kind=EMBEDDING is NOT LLM span');
+  assert(!isLlmSpan([kv('openinference.span.kind', 'AGENT')]), 'kind=AGENT is NOT LLM span');
+});
+
+describe('isLlmSpan — gen_ai attributes (OTel)', () => {
+  assert(isLlmSpan([kv('gen_ai.system', 'openai')]), 'gen_ai.system = LLM span');
+  assert(isLlmSpan([kv('gen_ai.request.model', 'gpt-4')]), 'gen_ai.request.model = LLM span');
+  assert(isLlmSpan([kv('gen_ai.usage.input_tokens', 100)]), 'gen_ai.usage.* = LLM span');
+});
+
+describe('isLlmSpan — OpenInference model/message attrs (no span.kind)', () => {
+  assert(isLlmSpan([kv('llm.model_name', 'gpt-4')]), 'llm.model_name = LLM span');
+  assert(isLlmSpan([kv('llm.request.type', 'chat')]), 'llm.request.type = LLM span');
+  assert(isLlmSpan([kv('llm.input_messages.0.message.role', 'user')]), 'llm.input_messages.* = LLM span');
+  assert(isLlmSpan([kv('llm.prompts.0.role', 'user')]), 'llm.prompts.* = LLM span');
+});
+
+describe('isLlmSpan — non-LLM spans', () => {
+  assert(!isLlmSpan([]), 'empty tags = not LLM');
+  assert(!isLlmSpan([kv('http.method', 'POST'), kv('http.url', '/api')]), 'HTTP span = not LLM');
+  assert(!isLlmSpan([kv('db.system', 'postgresql'), kv('db.statement', 'SELECT 1')]), 'DB span = not LLM');
+});
+
+describe('isLlmSpan — GCP vertex agent attrs (no gen_ai.system)', () => {
+  assert(isLlmSpan([kv('gcp.vertex.agent.llm_request', '{}')]), 'gcp.vertex.agent.llm_request = LLM span');
+  assert(isLlmSpan([kv('gcp.vertex.agent.llm_response', '{}')]), 'gcp.vertex.agent.llm_response = LLM span');
+});
+
+describe('isLlmSpan — generic operation.type completion', () => {
+  assert(isLlmSpan([kv('operation.type', 'chat_completion')]), 'operation.type=chat_completion = LLM span');
+  assert(isLlmSpan([kv('llm.operation.type', 'completion')]), 'llm.operation.type=completion = LLM span');
+  assert(!isLlmSpan([kv('operation.type', 'http_request')]), 'operation.type=http_request is NOT LLM span');
+});
+
+// ---------------------------------------------------------------------------
+// 6. detectConvention — tested indirectly via extractLlmSpanData.convention
+// ---------------------------------------------------------------------------
+
+describe('detectConvention — openinference.span.kind takes priority', () => {
+  // Even if gen_ai attrs exist, openinference.span.kind wins
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'LLM'),
+    kv('gen_ai.system', 'openai'),
+    kv('llm.model_name', 'gpt-4'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.convention, 'openinference', 'openinference wins over gen_ai');
+});
+
+describe('detectConvention — vertex detected before otel-genai when system=vertex_ai', () => {
+  // detectConvention returns 'vertex' for vertex_ai and extractLlmSpanData preserves it.
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'vertex_ai'),
+    kv('gen_ai.request.model', 'gemini-pro'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.convention, 'vertex', 'vertex_ai system -> convention = vertex');
+  assertEquals(result.isLlm, true, 'vertex span isLlm = true');
+  assertEquals(result.model, 'gemini-pro', 'model extracted via vertex extractor');
+});
+
+describe('detectConvention — vertex detected when gen_ai.system contains gcp', () => {
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'gcp-vertex'),
+    kv('gen_ai.request.model', 'gemini-1.0'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.convention, 'vertex', 'gcp system -> convention = vertex');
+  assertEquals(result.isLlm, true, 'gcp system isLlm = true');
+  assertEquals(result.model, 'gemini-1.0', 'model extracted');
+});
+
+describe('detectConvention — vertex detected from gcp.vertex.agent.llm_request alone (no gen_ai.system)', () => {
+  const llmRequest = JSON.stringify({
+    contents: [{ role: 'user', parts: [{ text: 'Hello' }] }],
+  });
+  const tags: KeyValuePair[] = [
+    kv('gcp.vertex.agent.llm_request', llmRequest),
+    kv('gen_ai.request.model', 'gemini-2.0-flash'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.convention, 'vertex', 'gcp.vertex.agent.* alone -> convention = vertex');
+  assertEquals(result.isLlm, true, 'isLlm = true');
+  assertEquals(result.inputMessages.length, 1, 'message parsed from llm_request blob');
+  assertEquals(result.inputMessages[0].content, 'Hello', 'content from gcp blob');
+});
+
+describe('detectConvention — otel-genai detected from gen_ai.system alone', () => {
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'anthropic'),
+    kv('gen_ai.request.model', 'claude-3-opus'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.convention, 'otel-genai', 'anthropic system -> otel-genai');
+});
+
+describe('detectConvention — openinference detected from llm.model_name alone', () => {
+  const tags: KeyValuePair[] = [
+    kv('llm.model_name', 'gpt-3.5-turbo'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.convention, 'openinference', 'llm.model_name -> openinference');
+});
+
+describe('detectConvention — generic from message-like value', () => {
+  const msgJson = JSON.stringify([{ role: 'user', content: 'hello world' }]);
+  const tags: KeyValuePair[] = [
+    kv('request.body', msgJson),
+    kv('operation.type', 'chat_completion'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.convention, 'generic', 'message-like value -> generic');
+});
+
+// ---------------------------------------------------------------------------
+// 7. extractIndexedMessages — tested via extractLlmSpanData
+// ---------------------------------------------------------------------------
+
+describe('extractIndexedMessages — ordering by index', () => {
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'LLM'),
+    // Intentionally out of order
+    kv('llm.input_messages.2.message.role', 'assistant'),
+    kv('llm.input_messages.2.message.content', 'second response'),
+    kv('llm.input_messages.0.message.role', 'system'),
+    kv('llm.input_messages.0.message.content', 'sys prompt'),
+    kv('llm.input_messages.1.message.role', 'user'),
+    kv('llm.input_messages.1.message.content', 'first question'),
+  ];
+
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages.length, 3, 'three messages extracted in order');
+  assertEquals(result.inputMessages[0].role, 'system', 'index 0 = system');
+  assertEquals(result.inputMessages[1].role, 'user', 'index 1 = user');
+  assertEquals(result.inputMessages[2].role, 'assistant', 'index 2 = assistant');
+});
+
+describe('extractIndexedMessages — tool role message', () => {
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'LLM'),
+    kv('llm.input_messages.0.message.role', 'user'),
+    kv('llm.input_messages.0.message.content', 'What is the weather?'),
+    kv('llm.input_messages.1.message.role', 'tool'),
+    kv('llm.input_messages.1.message.content', '{"temperature": "22C", "condition": "sunny"}'),
+  ];
+
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages[1].role, 'tool', 'tool role preserved');
+  assert(result.inputMessages[1].content.includes('22C'), 'tool result content preserved');
+});
+
+describe('extractIndexedMessages — short-form role/content keys', () => {
+  // Some frameworks use llm.input_messages.0.role (no "message." prefix)
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'LLM'),
+    kv('llm.input_messages.0.role', 'user'),
+    kv('llm.input_messages.0.content', 'Short form test'),
+    kv('llm.output_messages.0.role', 'assistant'),
+    kv('llm.output_messages.0.content', 'Short form reply'),
+  ];
+
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages[0].role, 'user', 'short-form role extracted');
+  assertEquals(result.inputMessages[0].content, 'Short form test', 'short-form content extracted');
+  assertEquals(result.outputMessages[0].role, 'assistant', 'short-form output role');
+  assertEquals(result.outputMessages[0].content, 'Short form reply', 'short-form output content');
+});
+
+// ---------------------------------------------------------------------------
+// 8. Edge cases
+// ---------------------------------------------------------------------------
+
+describe('Edge case — empty tags and logs', () => {
+  const result = extractLlmSpanData([], []);
+  assertEquals(result.isLlm, false, 'empty tags -> not LLM');
+  assertEquals(result.convention, 'unknown', 'empty tags -> unknown');
+  assertEquals(result.inputMessages.length, 0, 'no input messages');
+  assertEquals(result.outputMessages.length, 0, 'no output messages');
+  assertDeepEquals(result.tokenUsage, {}, 'empty tokenUsage');
+  assertDeepEquals(result.invocationParams, {}, 'empty invocationParams');
+});
+
+describe('Edge case — NaN token values are ignored', () => {
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'LLM'),
+    kv('llm.model_name', 'gpt-4'),
+    kv('llm.token_count.prompt', 'not-a-number'),
+    kv('llm.token_count.completion', null),
+    kv('llm.token_count.total', undefined),
+  ];
+
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.tokenUsage.input, undefined, 'invalid prompt tokens -> undefined');
+  // BUG-047 fix: null values now return undefined instead of 0
+  assertEquals(result.tokenUsage.output, undefined, 'null value now returns undefined (BUG-047 fix)');
+  assertEquals(result.tokenUsage.total, undefined, 'undefined total tokens -> undefined');
+});
+
+describe('Edge case — invocation_parameters invalid JSON is ignored', () => {
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'LLM'),
+    kv('llm.model_name', 'gpt-4'),
+    kv('llm.invocation_parameters', '{invalid json}'),
+  ];
+
+  const result = extractLlmSpanData(tags, []);
+  assertDeepEquals(result.invocationParams, {}, 'invalid JSON -> empty invocationParams');
+});
+
+describe('Edge case — mixed convention attrs (openinference + gen_ai)', () => {
+  // openinference.span.kind present — should use openinference path
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'LLM'),
+    kv('llm.model_name', 'claude-3-sonnet'),
+    kv('gen_ai.usage.input_tokens', 200),   // gen_ai tokens also present
+    kv('gen_ai.usage.output_tokens', 80),
+    kv('llm.input_messages.0.message.role', 'user'),
+    kv('llm.input_messages.0.message.content', 'Mixed query'),
+    kv('llm.output_messages.0.message.role', 'assistant'),
+    kv('llm.output_messages.0.message.content', 'Mixed response'),
+  ];
+
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.convention, 'openinference', 'openinference wins mixed');
+  // OpenInference extractor falls back to gen_ai.usage tokens when llm.token_count absent
+  assertEquals(result.tokenUsage.input, 200, 'falls back to gen_ai.usage.input_tokens');
+  assertEquals(result.tokenUsage.output, 80, 'falls back to gen_ai.usage.output_tokens');
+});
+
+describe('Edge case — OTel genai with no logs but gen_ai.prompt tag', () => {
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'openai'),
+    kv('gen_ai.request.model', 'gpt-4o'),
+    kv('gen_ai.prompt', 'Hello from tag'),
+    kv('gen_ai.completion', 'Reply from tag'),
+  ];
+
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.convention, 'otel-genai', 'convention = otel-genai');
+  assertEquals(result.inputMessages[0].content, 'Hello from tag', 'prompt from tag attr');
+  assertEquals(result.outputMessages[0].content, 'Reply from tag', 'completion from tag attr');
+});
+
+describe('Edge case — OpenInference falls back to input.value / output.value', () => {
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'LLM'),
+    kv('llm.model_name', 'gpt-4'),
+    kv('input.value', 'Plain text input'),
+    kv('output.value', 'Plain text output'),
+  ];
+
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages.length, 1, 'one input from input.value');
+  assertEquals(result.inputMessages[0].content, 'Plain text input', 'input.value used as content');
+  assertEquals(result.inputMessages[0].role, 'user', 'default role = user for plain input');
+  assertEquals(result.outputMessages.length, 1, 'one output from output.value');
+  assertEquals(result.outputMessages[0].role, 'assistant', 'default role = assistant for plain output');
+});
+
+describe('Edge case — OpenInference falls back to logs when no messages in tags', () => {
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'LLM'),
+    kv('llm.model_name', 'gpt-4'),
+  ];
+  const logs: SpanLog[] = [
+    log('gen_ai.content.prompt', [
+      kv('gen_ai.prompt', 'From log event'),
+    ]),
+    log('gen_ai.content.completion', [
+      kv('gen_ai.completion', 'Log reply'),
+    ]),
+  ];
+
+  const result = extractLlmSpanData(tags, logs);
+  assertEquals(result.inputMessages[0].content, 'From log event', 'input from log event');
+  assertEquals(result.outputMessages[0].content, 'Log reply', 'output from log event');
+});
+
+describe('Edge case — isLlmSpan case-sensitivity for span.kind', () => {
+  assert(isLlmSpan([kv('openinference.span.kind', 'llm')]), 'lowercase llm is detected as LLM');
+  assert(isLlmSpan([kv('openinference.span.kind', 'Llm')]), 'mixed case Llm is detected as LLM');
+  assert(!isLlmSpan([kv('openinference.span.kind', 'chain')]), 'lowercase chain is not LLM');
+});
+
+// ---------------------------------------------------------------------------
+// 9. Vertex AI — llm.prompts/completions message extraction
+// ---------------------------------------------------------------------------
+
+describe('Vertex AI — llm.prompts/completions message content extraction', () => {
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'vertex_ai'),
+    kv('gen_ai.request.model', 'gemini-1.5-pro'),
+    kv('llm.prompts.0.role', 'user'),
+    kv('llm.prompts.0.content', 'Describe the Eiffel Tower.'),
+    kv('llm.completions.0.role', 'model'),
+    kv('llm.completions.0.content', 'The Eiffel Tower is an iconic iron lattice tower.'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages.length, 1, 'one input message from llm.prompts');
+  assertEquals(result.inputMessages[0].role, 'user', 'llm.prompts role extracted');
+  assertEquals(result.inputMessages[0].content, 'Describe the Eiffel Tower.', 'llm.prompts content extracted');
+  assertEquals(result.outputMessages.length, 1, 'one output message from llm.completions');
+  assertEquals(result.outputMessages[0].role, 'model', 'llm.completions role extracted');
+  assertEquals(result.outputMessages[0].content, 'The Eiffel Tower is an iconic iron lattice tower.', 'llm.completions content extracted');
+});
+
+describe('Vertex AI — multi-turn llm.prompts ordering preserved', () => {
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'vertex_ai'),
+    kv('llm.prompts.0.role', 'system'),
+    kv('llm.prompts.0.content', 'You are a helpful assistant.'),
+    kv('llm.prompts.1.role', 'user'),
+    kv('llm.prompts.1.content', 'Hello!'),
+    kv('llm.completions.0.role', 'model'),
+    kv('llm.completions.0.content', 'Hi there!'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages.length, 2, 'two input messages preserved in order');
+  assertEquals(result.inputMessages[0].role, 'system', 'index 0 = system');
+  assertEquals(result.inputMessages[1].role, 'user', 'index 1 = user');
+  assertEquals(result.outputMessages[0].content, 'Hi there!', 'completion content correct');
+});
+
+describe('Vertex AI — llm.input_messages takes priority over llm.prompts', () => {
+  // Standard OpenInference messages should not be overwritten by llm.prompts fallback
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'LLM'),
+    kv('llm.model_name', 'gemini-pro'),
+    kv('llm.input_messages.0.message.role', 'user'),
+    kv('llm.input_messages.0.message.content', 'Primary message'),
+    kv('llm.prompts.0.role', 'user'),
+    kv('llm.prompts.0.content', 'Should not appear'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages.length, 1, 'only one input message');
+  assertEquals(result.inputMessages[0].content, 'Primary message', 'llm.input_messages wins over llm.prompts');
+});
+
+// ---------------------------------------------------------------------------
+// 10. Traceloop — gen_ai.prompt.{i}/gen_ai.completion.{i} flat indexed format
+// ---------------------------------------------------------------------------
+
+describe('Traceloop — gen_ai.prompt/completion flat indexed message extraction', () => {
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'openai'),
+    kv('gen_ai.request.model', 'gpt-4o'),
+    kv('gen_ai.prompt.0.role', 'system'),
+    kv('gen_ai.prompt.0.content', 'You are a code reviewer.'),
+    kv('gen_ai.prompt.1.role', 'user'),
+    kv('gen_ai.prompt.1.content', 'Review this function.'),
+    kv('gen_ai.completion.0.role', 'assistant'),
+    kv('gen_ai.completion.0.content', 'Looks good, add null checks.'),
+    kv('gen_ai.usage.input_tokens', 45),
+    kv('gen_ai.usage.output_tokens', 12),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages.length, 2, 'two input messages from gen_ai.prompt.*');
+  assertEquals(result.inputMessages[0].role, 'system', 'gen_ai.prompt.0 role = system');
+  assertEquals(result.inputMessages[0].content, 'You are a code reviewer.', 'gen_ai.prompt.0 content');
+  assertEquals(result.inputMessages[1].role, 'user', 'gen_ai.prompt.1 role = user');
+  assertEquals(result.outputMessages.length, 1, 'one output from gen_ai.completion.*');
+  assertEquals(result.outputMessages[0].role, 'assistant', 'gen_ai.completion.0 role = assistant');
+  assertEquals(result.outputMessages[0].content, 'Looks good, add null checks.', 'gen_ai.completion.0 content');
+  assertEquals(result.tokenUsage.input, 45, 'input tokens from gen_ai.usage');
+  assertEquals(result.tokenUsage.output, 12, 'output tokens from gen_ai.usage');
+});
+
+describe('Traceloop — span events take priority over gen_ai.prompt.* indexed attrs', () => {
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'openai'),
+    kv('gen_ai.request.model', 'gpt-4o'),
+    kv('gen_ai.prompt.0.role', 'user'),
+    kv('gen_ai.prompt.0.content', 'Flat indexed (should be ignored)'),
+  ];
+  const logs: SpanLog[] = [
+    log('gen_ai.content.prompt', [
+      kv('gen_ai.prompt', 'Event content wins'),
+    ]),
+  ];
+  const result = extractLlmSpanData(tags, logs);
+  assertEquals(result.inputMessages[0].content, 'Event content wins', 'span event content wins over flat indexed');
+});
+
+describe('Traceloop — gen_ai.prompt tag attr takes priority over gen_ai.prompt.* indexed', () => {
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'openai'),
+    kv('gen_ai.prompt', 'Direct prompt attr wins'),
+    kv('gen_ai.prompt.0.role', 'user'),
+    kv('gen_ai.prompt.0.content', 'Flat indexed (should be ignored)'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages[0].content, 'Direct prompt attr wins', 'gen_ai.prompt attr wins over indexed');
+});
+
+// ---------------------------------------------------------------------------
+// 11. GCP Vertex JSON blobs (gcp.vertex.agent.llm_request / llm_response)
+// ---------------------------------------------------------------------------
+
+describe('GCP Vertex — llm_request blob with contents array', () => {
+  const llmRequest = JSON.stringify({
+    contents: [
+      { role: 'user', parts: [{ text: 'What is the weather in Paris?' }] },
+    ],
+  });
+  const llmResponse = JSON.stringify({
+    candidates: [
+      { content: { role: 'model', parts: [{ text: 'The weather in Paris is sunny.' }] } },
+    ],
+  });
+  const tags = [
+    kv('gen_ai.system', 'vertex_ai'),
+    kv('gen_ai.request.model', 'gemini-2.0-flash'),
+    kv('gcp.vertex.agent.llm_request', llmRequest),
+    kv('gcp.vertex.agent.llm_response', llmResponse),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages.length, 1, 'one input message from llm_request');
+  assertEquals(result.inputMessages[0].role, 'user', 'user role from contents');
+  assertEquals(result.inputMessages[0].content, 'What is the weather in Paris?', 'content from parts.text');
+  assertEquals(result.outputMessages.length, 1, 'one output message from llm_response');
+  assertEquals(result.outputMessages[0].role, 'model', 'model role from candidates');
+  assertEquals(result.outputMessages[0].content, 'The weather in Paris is sunny.', 'content from candidates parts');
+});
+
+describe('GCP Vertex — llm_request with system_instruction', () => {
+  const llmRequest = JSON.stringify({
+    system_instruction: { parts: [{ text: 'You are a weather expert.' }] },
+    contents: [
+      { role: 'user', parts: [{ text: 'What is the weather?' }] },
+    ],
+  });
+  const tags = [
+    kv('gen_ai.system', 'vertex_ai'),
+    kv('gcp.vertex.agent.llm_request', llmRequest),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages.length, 2, 'system + user = 2 messages');
+  assertEquals(result.inputMessages[0].role, 'system', 'system_instruction becomes system role');
+  assertEquals(result.inputMessages[0].content, 'You are a weather expert.', 'system_instruction content');
+  assertEquals(result.inputMessages[1].role, 'user', 'user content follows');
+});
+
+describe('GCP Vertex — llm_request multi-turn conversation', () => {
+  const llmRequest = JSON.stringify({
+    contents: [
+      { role: 'user', parts: [{ text: 'Hello' }] },
+      { role: 'model', parts: [{ text: 'Hi there!' }] },
+      { role: 'user', parts: [{ text: 'How are you?' }] },
+    ],
+  });
+  const tags = [
+    kv('gen_ai.system', 'vertex_ai'),
+    kv('gcp.vertex.agent.llm_request', llmRequest),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages.length, 3, 'three messages in multi-turn');
+  assertEquals(result.inputMessages[0].role, 'user', 'turn 0 = user');
+  assertEquals(result.inputMessages[1].role, 'model', 'turn 1 = model');
+  assertEquals(result.inputMessages[2].role, 'user', 'turn 2 = user');
+});
+
+describe('GCP Vertex — llm_request blob does not override llm.prompts', () => {
+  const llmRequest = JSON.stringify({
+    contents: [{ role: 'user', parts: [{ text: 'GCP blob (should be ignored)' }] }],
+  });
+  const tags = [
+    kv('gen_ai.system', 'vertex_ai'),
+    kv('llm.prompts.0.role', 'user'),
+    kv('llm.prompts.0.content', 'Primary message from llm.prompts'),
+    kv('gcp.vertex.agent.llm_request', llmRequest),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages[0].content, 'Primary message from llm.prompts', 'llm.prompts wins over gcp blob');
+});
+
+// ---------------------------------------------------------------------------
+// 12. gen_ai.input_messages / gen_ai.output_messages JSON arrays
+// ---------------------------------------------------------------------------
+
+describe('gen_ai.input_messages / gen_ai.output_messages JSON string arrays', () => {
+  const inputMsgs = JSON.stringify([
+    { role: 'system', content: 'You are a helpful assistant.' },
+    { role: 'user', content: 'Explain quantum computing.' },
+  ]);
+  const outputMsgs = JSON.stringify([
+    { role: 'assistant', content: 'Quantum computing uses quantum bits...' },
+  ]);
+  const tags = [
+    kv('gen_ai.system', 'openai'),
+    kv('gen_ai.request.model', 'gpt-4o'),
+    kv('gen_ai.input_messages', inputMsgs),
+    kv('gen_ai.output_messages', outputMsgs),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages.length, 2, 'two messages from gen_ai.input_messages');
+  assertEquals(result.inputMessages[0].role, 'system', 'system message extracted');
+  assertEquals(result.inputMessages[0].content, 'You are a helpful assistant.', 'system content');
+  assertEquals(result.inputMessages[1].role, 'user', 'user message extracted');
+  assertEquals(result.outputMessages.length, 1, 'one output from gen_ai.output_messages');
+  assertEquals(result.outputMessages[0].content, 'Quantum computing uses quantum bits...', 'output content');
+});
+
+describe('gen_ai.input_messages lower priority than span events', () => {
+  const inputMsgs = JSON.stringify([{ role: 'user', content: 'JSON attr (should be ignored)' }]);
+  const tags = [
+    kv('gen_ai.system', 'openai'),
+    kv('gen_ai.input_messages', inputMsgs),
+  ];
+  const logs: SpanLog[] = [
+    log('gen_ai.content.prompt', [kv('gen_ai.prompt', 'Event wins over JSON attr')]),
+  ];
+  const result = extractLlmSpanData(tags, logs);
+  assertEquals(result.inputMessages[0].content, 'Event wins over JSON attr', 'span event wins over gen_ai.input_messages');
+});
+
+// ---------------------------------------------------------------------------
+// 13. extractMessagesFromJsonValue — wrapped object formats (untested paths)
+// ---------------------------------------------------------------------------
+
+describe('extractMessagesFromJsonValue — {messages:[...]} wrapper object', () => {
+  // The function handles top-level objects whose messages/Messages/prompt field
+  // is an array.  None of the existing tests exercised this code path.
+  const wrapped = JSON.stringify({
+    messages: [
+      { role: 'system', content: 'Be concise.' },
+      { role: 'user', content: 'Summarise the report.' },
+    ],
+  });
+  const tags: KeyValuePair[] = [
+    kv('operation.type', 'chat_completion'),
+    kv('input.value', wrapped),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.convention, 'generic', 'convention = generic for wrapped messages');
+  assertEquals(result.inputMessages.length, 2, 'two messages extracted from {messages:[...]}');
+  assertEquals(result.inputMessages[0].role, 'system', 'system role extracted');
+  assertEquals(result.inputMessages[0].content, 'Be concise.', 'system content extracted');
+  assertEquals(result.inputMessages[1].role, 'user', 'user role extracted');
+  assertEquals(result.inputMessages[1].content, 'Summarise the report.', 'user content extracted');
+});
+
+describe('extractMessagesFromJsonValue — single-message {role,content} object', () => {
+  // A top-level object (not an array) with role + content should yield one message.
+  const singleMsg = JSON.stringify({ role: 'user', content: 'Single object message.' });
+  const tags: KeyValuePair[] = [
+    kv('operation.type', 'chat_completion'),
+    kv('input.value', singleMsg),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages.length, 1, 'one message from single {role,content} object');
+  assertEquals(result.inputMessages[0].role, 'user', 'role preserved');
+  assertEquals(result.inputMessages[0].content, 'Single object message.', 'content preserved');
+});
+
+// ---------------------------------------------------------------------------
+// 14. looksLikeMessages — boundary / negative cases
+// ---------------------------------------------------------------------------
+
+describe('looksLikeMessages boundary — string shorter than 10 chars is rejected', () => {
+  // Even if it contains "role", strings under 10 chars are not treated as messages.
+  // The generic extractor therefore won't pick them up, preventing false positives.
+  const tinyJson = '{"role":"'; // 9 chars, malformed but short
+  const tags: KeyValuePair[] = [
+    kv('operation.type', 'chat_completion'),
+    kv('input.value', tinyJson),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  // Should not extract any messages because looksLikeMessages returns false
+  assertEquals(result.inputMessages.length, 0, 'too-short string produces no messages');
+});
+
+describe('looksLikeMessages boundary — has "role" but no "content" or "message" is rejected', () => {
+  // JSON with "role" key but neither "content" nor "message" sub-key should NOT
+  // pass looksLikeMessages, so no messages are extracted.
+  const noContent = JSON.stringify([{ role: 'user', text: 'hello' }]); // "text" instead of "content"
+  const tags: KeyValuePair[] = [
+    kv('operation.type', 'chat_completion'),
+    kv('input.value', noContent),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  // looksLikeMessages requires "content" or "message" — pure "text" field fails the check
+  assertEquals(result.inputMessages.length, 0, 'missing "content"/"message" key → no messages extracted');
+});
+
+// ---------------------------------------------------------------------------
+// 15. Generic convention — plain-text output.value is NOT extracted as message
+// ---------------------------------------------------------------------------
+
+describe('Generic convention — plain-text output.value without message structure', () => {
+  // The generic extractor only converts output.value to messages when looksLikeMessages
+  // returns true.  Plain strings should NOT appear as an output message.
+  const inputJson = JSON.stringify([{ role: 'user', content: 'What is 2+2?' }]);
+  const tags: KeyValuePair[] = [
+    kv('operation.type', 'chat_completion'),
+    kv('input.value', inputJson),
+    kv('output.value', 'The answer is 4.'),   // plain text, no role/content keys
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages.length, 1, 'input message extracted normally');
+  assertEquals(result.outputMessages.length, 0, 'plain-text output.value produces no output messages');
+});
+
+// ---------------------------------------------------------------------------
+// 16. OpenInference — null / empty content strings do not crash extraction
+// ---------------------------------------------------------------------------
+
+describe('OpenInference — null-like content values in indexed messages', () => {
+  // Some instrumentation libraries emit null or empty string for content.
+  // Extraction should still succeed without throwing.
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'LLM'),
+    kv('llm.model_name', 'gpt-4'),
+    kv('llm.input_messages.0.message.role', 'user'),
+    kv('llm.input_messages.0.message.content', null),   // null content
+    kv('llm.input_messages.1.message.role', 'assistant'),
+    kv('llm.input_messages.1.message.content', ''),     // empty string content
+    kv('llm.output_messages.0.message.role', 'assistant'),
+    kv('llm.output_messages.0.message.content', null),  // null output
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.isLlm, true, 'isLlm = true even with null/empty content');
+  assertEquals(result.inputMessages.length, 2, 'two input messages despite null/empty content');
+  assertEquals(result.inputMessages[0].role, 'user', 'role preserved for null-content message');
+  assertEquals(result.inputMessages[0].content, 'null', 'null coerced to string "null"');
+  assertEquals(result.inputMessages[1].content, '', 'empty string content preserved');
+  assertEquals(result.outputMessages.length, 1, 'output message present despite null content');
+});
+
+// ---------------------------------------------------------------------------
+// 17. Generic convention — output JSON array with messages extracted correctly
+// ---------------------------------------------------------------------------
+
+describe('Generic convention — output.value as JSON message array', () => {
+  // GENERIC_TRACE_RESPONSE uses this pattern: output.value is a JSON array of messages.
+  // This verifies the same data path the fixture exercises but as a targeted unit test.
+  const inputJson = JSON.stringify([
+    { role: 'system', content: 'You are a code review assistant.' },
+    { role: 'user', content: 'Review this function for bugs.' },
+  ]);
+  const outputJson = JSON.stringify([
+    { role: 'assistant', content: 'The function looks correct. Consider adding null checks on line 5.' },
+  ]);
+  const tags: KeyValuePair[] = [
+    kv('operation.type', 'chat_completion'),
+    kv('model', 'my-custom-llm-v2'),
+    kv('temperature', 0.8),
+    kv('max_tokens', 256),
+    kv('input.value', inputJson),
+    kv('output.value', outputJson),
+    kv('prompt_tokens', 38),
+    kv('completion_tokens', 22),
+    kv('total_tokens', 60),
+    kv('finish_reason', 'stop'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.convention, 'generic', 'convention = generic');
+  assertEquals(result.isLlm, true, 'isLlm = true');
+  assertEquals(result.model, 'my-custom-llm-v2', 'model extracted');
+  assertEquals(result.inputMessages.length, 2, 'two input messages');
+  assertEquals(result.inputMessages[0].role, 'system', 'system message role');
+  assertEquals(result.inputMessages[1].role, 'user', 'user message role');
+  assertEquals(result.outputMessages.length, 1, 'one output message');
+  assertEquals(result.outputMessages[0].role, 'assistant', 'assistant output role');
+  assertEquals(result.outputMessages[0].content, 'The function looks correct. Consider adding null checks on line 5.', 'output content');
+  assertEquals(result.tokenUsage.input, 38, 'prompt_tokens');
+  assertEquals(result.tokenUsage.output, 22, 'completion_tokens');
+  assertEquals(result.tokenUsage.total, 60, 'total_tokens');
+  assertEquals(result.finishReason, 'stop', 'finish_reason extracted');
+  assertEquals(result.invocationParams.temperature, 0.8, 'temperature');
+  assertEquals(result.invocationParams.maxTokens, 256, 'maxTokens');
+});
+
+// ---------------------------------------------------------------------------
+// 18. OTel GenAI — gen_ai.response.model preference over gen_ai.request.model
+//     (fix: response.model now takes priority since that is what was actually served)
+// ---------------------------------------------------------------------------
+
+describe('OTel GenAI — gen_ai.response.model takes priority over gen_ai.request.model', () => {
+  // A common streaming scenario: the request asked for 'gpt-4' but the provider
+  // routed to / confirmed 'gpt-4-0613' in the response headers.
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'openai'),
+    kv('gen_ai.request.model', 'gpt-4'),
+    kv('gen_ai.response.model', 'gpt-4-0613'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.convention, 'otel-genai', 'convention = otel-genai');
+  assertEquals(result.model, 'gpt-4-0613', 'gen_ai.response.model wins over gen_ai.request.model');
+});
+
+describe('OTel GenAI — gen_ai.request.model used when response.model absent', () => {
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'anthropic'),
+    kv('gen_ai.request.model', 'claude-3-opus'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.model, 'claude-3-opus', 'request.model used when response.model absent');
+});
+
+describe('OTel GenAI — gen_ai.response.model used when request.model absent', () => {
+  // Some instrumentation only records the response model (e.g. after streaming completes).
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'openai'),
+    kv('gen_ai.response.model', 'gpt-4o-2024-08-06'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.model, 'gpt-4o-2024-08-06', 'response.model used when request.model absent');
+});
+
+// ---------------------------------------------------------------------------
+// 19. OTel GenAI — gen_ai.request.top_k and other less-common params are surfaced
+//     (fix: these were previously silently dropped from invocationParams)
+// ---------------------------------------------------------------------------
+
+describe('OTel GenAI — gen_ai.request.top_k is included in invocationParams', () => {
+  // top_k is used by Anthropic (claude), Gemini and others; it was not previously extracted.
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'anthropic'),
+    kv('gen_ai.request.model', 'claude-3-sonnet'),
+    kv('gen_ai.request.temperature', 0.7),
+    kv('gen_ai.request.top_p', 0.9),
+    kv('gen_ai.request.top_k', 40),
+    kv('gen_ai.request.max_tokens', 1024),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.convention, 'otel-genai', 'convention = otel-genai');
+  assertEquals(result.invocationParams.temperature, 0.7, 'temperature present');
+  assertEquals(result.invocationParams.topP, 0.9, 'topP present');
+  assertEquals(result.invocationParams.maxTokens, 1024, 'maxTokens present');
+  assertEquals((result.invocationParams as any).topK, 40, 'topK extracted from gen_ai.request.top_k');
+});
+
+describe('OTel GenAI — gen_ai.request.frequency_penalty and presence_penalty extracted', () => {
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'openai'),
+    kv('gen_ai.request.model', 'gpt-4o'),
+    kv('gen_ai.request.frequency_penalty', 0.5),
+    kv('gen_ai.request.presence_penalty', 0.3),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals((result.invocationParams as any).frequencyPenalty, 0.5, 'frequencyPenalty from gen_ai.request.frequency_penalty');
+  assertEquals((result.invocationParams as any).presencePenalty, 0.3, 'presencePenalty from gen_ai.request.presence_penalty');
+});
+
+describe('OTel GenAI — gen_ai.operation.name exposed in invocationParams', () => {
+  // gen_ai.operation.name is the primary span identifier set by opentelemetry-instrumentation-openai.
+  // It should be surfaced so the UI can show it (e.g. "chat", "embeddings", "completions").
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'openai'),
+    kv('gen_ai.operation.name', 'chat'),
+    kv('gen_ai.request.model', 'gpt-4o-mini'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.convention, 'otel-genai', 'convention = otel-genai');
+  assertEquals((result.invocationParams as any).operationName, 'chat', 'operationName from gen_ai.operation.name');
+});
+
+describe('OTel GenAI — optional params absent means they are not injected into invocationParams', () => {
+  // When optional attributes are not present, they must not appear in the params object
+  // (do not inject undefined values — they clutter the UI with empty rows).
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'openai'),
+    kv('gen_ai.request.model', 'gpt-4o'),
+    kv('gen_ai.request.temperature', 0.5),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assert(!('topK' in result.invocationParams), 'topK absent when gen_ai.request.top_k not set');
+  assert(!('frequencyPenalty' in result.invocationParams), 'frequencyPenalty absent when not set');
+  assert(!('operationName' in result.invocationParams), 'operationName absent when not set');
+});
+
+// ---------------------------------------------------------------------------
+// 20. detectConvention — gen_ai.operation.name without gen_ai.system is still otel-genai
+//     (opentelemetry-instrumentation-openai sets gen_ai.operation.name on all LLM spans)
+// ---------------------------------------------------------------------------
+
+describe('detectConvention — span with only gen_ai.operation.name is detected as otel-genai', () => {
+  // opentelemetry-instrumentation-openai sets gen_ai.operation.name without gen_ai.system
+  // on some versions. The span must still be detected as an LLM span.
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.operation.name', 'chat'),
+    kv('gen_ai.request.model', 'gpt-4o'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  // gen_ai.request.model starts with "gen_ai." so detectConvention returns otel-genai
+  assertEquals(result.convention, 'otel-genai', 'gen_ai.operation.name span detected as otel-genai');
+  assertEquals(result.isLlm, true, 'isLlm = true');
+  assertEquals(result.model, 'gpt-4o', 'model extracted');
+});
+
+// ---------------------------------------------------------------------------
+// BUG-001: isLlmSpan() should return true for GUARDRAIL spans
+// ---------------------------------------------------------------------------
+
+describe('BUG-001: isLlmSpan returns true for GUARDRAIL spans', () => {
+  assert(isLlmSpan([kv('openinference.span.kind', 'GUARDRAIL')]), 'GUARDRAIL kind is an LLM span');
+  assert(isLlmSpan([kv('openinference.span.kind', 'guardrail')]), 'lowercase guardrail is an LLM span');
+  assert(!isLlmSpan([kv('openinference.span.kind', 'CHAIN')]), 'CHAIN is still not an LLM span');
+  assert(!isLlmSpan([kv('openinference.span.kind', 'TOOL')]), 'TOOL is still not an LLM span');
+});
+
+// ---------------------------------------------------------------------------
+// BUG-002: isEmbeddingSpan() checks gen_ai.operation.name
+// ---------------------------------------------------------------------------
+
+describe('BUG-002: isEmbeddingSpan checks gen_ai.operation.name', () => {
+  assert(isEmbeddingSpan([kv('gen_ai.operation.name', 'embeddings')]), 'gen_ai.operation.name=embeddings is embedding');
+  assert(isEmbeddingSpan([kv('gen_ai.operation.name', 'create_embeddings')]), 'gen_ai.operation.name=create_embeddings is embedding');
+  assert(isEmbeddingSpan([kv('gen_ai.operation.name', 'embed')]), 'gen_ai.operation.name=embed is embedding');
+  assert(!isEmbeddingSpan([kv('gen_ai.operation.name', 'chat')]), 'gen_ai.operation.name=chat is NOT embedding');
+  assert(isEmbeddingSpan([kv('llm.request.type', 'embedding')]), 'llm.request.type still works');
+  // isLlmSpan returns false for embedding spans
+  assert(!isLlmSpan([kv('gen_ai.operation.name', 'embeddings'), kv('llm.model_name', 'text-embedding-3')]), 'embedding span is not an LLM span');
+});
+
+// ---------------------------------------------------------------------------
+// BUG-003: detectConvention — llm.model_name check before llm.prompts.*
+//          Traceloop spans with llm.model_name must be openinference, not vertex
+// ---------------------------------------------------------------------------
+
+describe('BUG-003: llm.model_name takes priority over llm.prompts.* for convention detection', () => {
+  // A span with llm.model_name AND llm.prompts.* (Traceloop-style) should be openinference
+  const tags: KeyValuePair[] = [
+    kv('llm.model_name', 'gpt-4o'),
+    kv('llm.prompts.0.role', 'user'),
+    kv('llm.prompts.0.content', 'Hello'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.convention, 'openinference', 'llm.model_name wins: convention = openinference not vertex');
+  assertEquals(result.model, 'gpt-4o', 'model extracted correctly');
+});
+
+describe('BUG-003: llm.input_messages.* takes priority over llm.prompts.* for convention detection', () => {
+  const tags: KeyValuePair[] = [
+    kv('llm.input_messages.0.message.role', 'user'),
+    kv('llm.input_messages.0.message.content', 'Hello'),
+    kv('llm.prompts.0.role', 'user'),
+    kv('llm.prompts.0.content', 'Should not affect convention'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.convention, 'openinference', 'llm.input_messages.* wins: convention = openinference');
+});
+
+describe('BUG-003 regression: Traceloop span with gen_ai.system + llm.request.type uses otel-genai, not openinference', () => {
+  // Traceloop emits both llm.request.type AND gen_ai.system + gen_ai.prompt.* on the same span.
+  // gen_ai.system must win: the span is otel-genai so gen_ai.prompt.* messages are extracted.
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'openai'),
+    kv('gen_ai.request.model', 'gpt-4.1'),
+    kv('llm.request.type', 'chat'),
+    kv('gen_ai.prompt.0.role', 'system'),
+    kv('gen_ai.prompt.0.content', 'You are helpful.'),
+    kv('gen_ai.prompt.1.role', 'user'),
+    kv('gen_ai.prompt.1.content', 'Hello'),
+    kv('gen_ai.completion.0.role', 'assistant'),
+    kv('gen_ai.completion.0.content', 'Hi there!'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.convention, 'otel-genai', 'gen_ai.system=openai wins over llm.request.type: convention = otel-genai');
+  assertEquals(result.inputMessages.length, 2, 'both gen_ai.prompt messages extracted');
+  assertEquals(result.inputMessages[0].role, 'system', 'system message extracted');
+  assertEquals(result.inputMessages[1].role, 'user', 'user message extracted');
+  assertEquals(result.outputMessages.length, 1, 'gen_ai.completion message extracted');
+  assertEquals(result.outputMessages[0].content, 'Hi there!', 'assistant content correct');
+});
+
+// ---------------------------------------------------------------------------
+// BUG-008/BUG-046: looksLikeMessages should NOT match "message" field
+// ---------------------------------------------------------------------------
+
+describe('BUG-008: looksLikeMessages does not trigger on "message" field (only "content")', () => {
+  // A JSON with "role" and "message" but no "content" should NOT be treated as messages
+  const withMessageField = JSON.stringify([{ role: 'user', message: 'hello world this is long enough' }]);
+  const tags: KeyValuePair[] = [
+    kv('operation.type', 'chat_completion'),
+    kv('input.value', withMessageField),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages.length, 0, '"message" field without "content" does not produce messages');
+
+  // A JSON with "role" and "content" SHOULD still be treated as messages
+  const withContentField = JSON.stringify([{ role: 'user', content: 'hello world this is long enough' }]);
+  const tags2: KeyValuePair[] = [
+    kv('operation.type', 'chat_completion'),
+    kv('input.value', withContentField),
+  ];
+  const result2 = extractLlmSpanData(tags2, []);
+  assertEquals(result2.inputMessages.length, 1, '"content" field still produces messages');
+});
+
+// ---------------------------------------------------------------------------
+// BUG-016: decodeUnicodeEscapes handles surrogate pairs (emoji)
+// ---------------------------------------------------------------------------
+
+describe('BUG-016: decodeUnicodeEscapes handles surrogate pairs for emoji', () => {
+  // Import decodeUnicodeEscapes via extractLlmSpanData by putting emoji in content
+  // 😀 = U+1F600, encoded as surrogate pair \uD83D\uDE00
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'LLM'),
+    kv('llm.model_name', 'gpt-4'),
+    kv('llm.input_messages.0.message.role', 'user'),
+    kv('llm.input_messages.0.message.content', 'Hello \\uD83D\\uDE00 world'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages[0].content, 'Hello 😀 world', 'surrogate pair decoded to emoji');
+});
+
+describe('BUG-016: decodeUnicodeEscapes handles regular BMP unicode (non-surrogate)', () => {
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'LLM'),
+    kv('llm.model_name', 'gpt-4'),
+    kv('llm.input_messages.0.message.role', 'user'),
+    kv('llm.input_messages.0.message.content', '\\u82f1\\u8a9e'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages[0].content, '英語', 'BMP unicode escapes decoded');
+});
+
+// ---------------------------------------------------------------------------
+// BUG-027: extractOpenInference parses Python repr invocation_parameters
+// ---------------------------------------------------------------------------
+
+describe('BUG-027: invocation_parameters with Python repr format (single quotes, True/False/None)', () => {
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'LLM'),
+    kv('llm.model_name', 'gpt-4'),
+    kv('llm.invocation_parameters', "{'temperature': 0.7, 'max_tokens': 512, 'stream': True, 'stop': None}"),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals((result.invocationParams as any).temperature, 0.7, 'temperature parsed from Python repr');
+  assertEquals((result.invocationParams as any).max_tokens, 512, 'max_tokens parsed from Python repr');
+  assertEquals((result.invocationParams as any).stream, true, 'True converted to true');
+  assertEquals((result.invocationParams as any).stop, null, 'None converted to null');
+});
+
+describe('BUG-027: invocation_parameters falls back to gen_ai.request.* when completely unparseable', () => {
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'LLM'),
+    kv('llm.model_name', 'gpt-4'),
+    kv('llm.invocation_parameters', 'totally unparseable string !!!'),
+    kv('gen_ai.request.temperature', 0.5),
+    kv('gen_ai.request.max_tokens', 256),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.invocationParams.temperature, 0.5, 'temperature fallback from gen_ai.request.temperature');
+  assertEquals(result.invocationParams.maxTokens, 256, 'maxTokens fallback from gen_ai.request.max_tokens');
+});
+
+// ---------------------------------------------------------------------------
+// BUG-028: extractOtelGenAi checks native array for finish reasons
+// ---------------------------------------------------------------------------
+
+describe('BUG-028: finish reason from native array attribute gen_ai.response.finish_reasons', () => {
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'openai'),
+    kv('gen_ai.request.model', 'gpt-4'),
+    kv('gen_ai.response.finish_reasons', JSON.stringify(['stop'])),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.finishReason, 'stop', 'finish reason extracted from native array attribute');
+});
+
+describe('BUG-028: dotted path gen_ai.response.finish_reasons.0 still works', () => {
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'openai'),
+    kv('gen_ai.request.model', 'gpt-4'),
+    kv('gen_ai.response.finish_reasons.0', 'length'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.finishReason, 'length', 'dotted path finish reason still works');
+});
+
+// ---------------------------------------------------------------------------
+// BUG-029: getAttr returns undefined (not "null") when tag.value === null
+// ---------------------------------------------------------------------------
+
+describe('BUG-029: getAttr returns undefined when tag.value is null', () => {
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'LLM'),
+    kv('llm.model_name', null),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  // model should fall through to 'unknown' since llm.model_name is null
+  assertEquals(result.model, 'unknown', 'null tag value produces undefined, falls through to unknown');
+});
+
+// ---------------------------------------------------------------------------
+// BUG-030: extractIndexedMessages handles object content (not [object Object])
+// ---------------------------------------------------------------------------
+
+describe('BUG-030: extractIndexedMessages serializes object content to JSON', () => {
+  const multiModalContent = [{ type: 'text', text: 'hello' }, { type: 'image_url', url: 'http://x.com/img.png' }];
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'LLM'),
+    kv('llm.model_name', 'gpt-4o'),
+    kv('llm.input_messages.0.message.role', 'user'),
+    kv('llm.input_messages.0.message.content', multiModalContent),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assert(result.inputMessages[0].content !== '[object Object]', 'content is not [object Object]');
+  assert(result.inputMessages[0].content.includes('"type"'), 'object content is JSON stringified');
+});
+
+// ---------------------------------------------------------------------------
+// BUG-032: single-object JSON branch in extractMessagesFromJsonValue includes toolCalls
+// ---------------------------------------------------------------------------
+
+describe('BUG-032: single-object message includes toolCalls', () => {
+  const singleWithToolCalls = JSON.stringify({
+    role: 'assistant',
+    content: '',
+    tool_calls: [{ function: { name: 'search', arguments: '{"q":"test"}' }, id: 'call_1' }],
+  });
+  const tags: KeyValuePair[] = [
+    kv('operation.type', 'chat_completion'),
+    kv('input.value', singleWithToolCalls),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages.length, 1, 'single object message extracted');
+  assert(Array.isArray(result.inputMessages[0].toolCalls), 'toolCalls is array');
+  assertEquals(result.inputMessages[0].toolCalls?.[0].name, 'search', 'tool call name preserved');
+});
+
+// ---------------------------------------------------------------------------
+// BUG-033: double-encoded JSON strings in events are handled
+// ---------------------------------------------------------------------------
+
+describe('BUG-033: double-encoded JSON content in gen_ai events is decoded', () => {
+  const innerContent = JSON.stringify([{ role: 'user', content: 'inner message' }]);
+  const doubleEncoded = JSON.stringify(innerContent); // wrap again as JSON string
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'openai'),
+    kv('gen_ai.request.model', 'gpt-4'),
+  ];
+  const logs: SpanLog[] = [
+    log('gen_ai.content.prompt', [
+      kv('gen_ai.prompt', doubleEncoded),
+    ]),
+  ];
+  const result = extractLlmSpanData(tags, logs);
+  assertEquals(result.inputMessages.length, 1, 'double-encoded JSON messages decoded');
+  assertEquals(result.inputMessages[0].content, 'inner message', 'inner message content extracted');
+  assertEquals(result.inputMessages[0].role, 'user', 'inner message role extracted');
+});
+
+// ---------------------------------------------------------------------------
+// BUG-045: extractOpenInference checks gen_ai.response.model first
+// ---------------------------------------------------------------------------
+
+describe('BUG-045: extractOpenInference uses gen_ai.response.model over llm.model_name', () => {
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'LLM'),
+    kv('llm.model_name', 'gpt-4'),
+    kv('gen_ai.response.model', 'gpt-4-turbo-2024-04-09'),
+    kv('gen_ai.request.model', 'gpt-4-turbo'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.model, 'gpt-4-turbo-2024-04-09', 'gen_ai.response.model takes first priority in openinference');
+});
+
+// ---------------------------------------------------------------------------
+// BUG-047 + BUG-079: getNumAttr returns undefined for null and empty string
+// ---------------------------------------------------------------------------
+
+describe('BUG-047: getNumAttr returns undefined for null tag value', () => {
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'LLM'),
+    kv('llm.model_name', 'gpt-4'),
+    kv('llm.token_count.prompt', null),
+    kv('llm.token_count.completion', undefined),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.tokenUsage.input, undefined, 'null token count returns undefined (not 0)');
+  assertEquals(result.tokenUsage.output, undefined, 'undefined token count returns undefined');
+});
+
+describe('BUG-079: getNumAttr returns undefined for empty/whitespace string', () => {
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'LLM'),
+    kv('llm.model_name', 'gpt-4'),
+    kv('llm.token_count.prompt', ''),
+    kv('llm.token_count.completion', '   '),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.tokenUsage.input, undefined, 'empty string token count returns undefined');
+  assertEquals(result.tokenUsage.output, undefined, 'whitespace string token count returns undefined');
+});
+
+// ---------------------------------------------------------------------------
+// BUG-080: getAttr returns undefined for null tag value (doesn't return "null" string)
+// ---------------------------------------------------------------------------
+
+describe('BUG-080: getAttr returns undefined (not "null") for null values — detectConvention unaffected', () => {
+  // If openinference.span.kind === null, detectConvention must NOT treat it as openinference
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', null),
+    kv('gen_ai.system', 'openai'),
+    kv('gen_ai.request.model', 'gpt-4'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.convention, 'otel-genai', 'null openinference.span.kind does not force openinference convention');
+});
+
+// ---------------------------------------------------------------------------
+// BUG-081: extractGcpVertex*Messages handles functionCall/functionResponse parts
+// ---------------------------------------------------------------------------
+
+describe('BUG-081: extractGcpVertexResponseMessages includes functionCall parts', () => {
+  const llmResponse = JSON.stringify({
+    candidates: [{
+      content: {
+        role: 'model',
+        parts: [
+          { functionCall: { name: 'getWeather', args: { city: 'Paris' } } },
+        ],
+      },
+    }],
+  });
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'vertex_ai'),
+    kv('gcp.vertex.agent.llm_response', llmResponse),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.outputMessages.length, 1, 'one output message');
+  assert(result.outputMessages[0].content.includes('getWeather'), 'functionCall name is included in content');
+  assert(result.outputMessages[0].content.includes('Function call:'), 'functionCall prefix included');
+});
+
+describe('BUG-081: extractGcpVertexRequestMessages includes functionResponse parts', () => {
+  const llmRequest = JSON.stringify({
+    contents: [{
+      role: 'user',
+      parts: [
+        { functionResponse: { name: 'getWeather', response: { temperature: '22C' } } },
+      ],
+    }],
+  });
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'vertex_ai'),
+    kv('gcp.vertex.agent.llm_request', llmRequest),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages.length, 1, 'one input message');
+  assert(result.inputMessages[0].content.includes('getWeather'), 'functionResponse name is included in content');
+  assert(result.inputMessages[0].content.includes('Function response:'), 'functionResponse prefix included');
+});
+
+// ---------------------------------------------------------------------------
+// BUG-082: extractIndexedMessages defaults missing role to 'user'
+// ---------------------------------------------------------------------------
+
+describe('BUG-082: extractIndexedMessages defaults empty role to user', () => {
+  const tags: KeyValuePair[] = [
+    kv('openinference.span.kind', 'LLM'),
+    kv('llm.model_name', 'gpt-4'),
+    kv('llm.input_messages.0.message.content', 'message with no role'),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages.length, 1, 'message extracted even without role');
+  assertEquals(result.inputMessages[0].role, 'user', 'missing role defaults to user');
+  assertEquals(result.inputMessages[0].content, 'message with no role', 'content preserved');
+});
+
+// ---------------------------------------------------------------------------
+// BUG-083: extractMessagesFromEvents accumulates gen_ai.choice events by index
+// ---------------------------------------------------------------------------
+
+describe('BUG-083: gen_ai.choice streaming events are accumulated by index', () => {
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'openai'),
+    kv('gen_ai.request.model', 'gpt-4'),
+  ];
+  const logs: SpanLog[] = [
+    log('gen_ai.choice', [kv('gen_ai.content', 'Hello'), kv('gen_ai.choice.index', '0')]),
+    log('gen_ai.choice', [kv('gen_ai.content', ', world'), kv('gen_ai.choice.index', '0')]),
+    log('gen_ai.choice', [kv('gen_ai.content', '!'), kv('gen_ai.choice.index', '0')]),
+  ];
+  const result = extractLlmSpanData(tags, logs);
+  assertEquals(result.outputMessages.length, 1, 'streaming chunks accumulated into one message');
+  assertEquals(result.outputMessages[0].content, 'Hello, world!', 'chunks concatenated in order');
+});
+
+describe('BUG-083: multiple gen_ai.choice indices produce separate messages', () => {
+  const tags: KeyValuePair[] = [
+    kv('gen_ai.system', 'openai'),
+    kv('gen_ai.request.model', 'gpt-4'),
+  ];
+  const logs: SpanLog[] = [
+    log('gen_ai.choice', [kv('gen_ai.content', 'Choice A'), kv('gen_ai.choice.index', '0')]),
+    log('gen_ai.choice', [kv('gen_ai.content', 'Choice B'), kv('gen_ai.choice.index', '1')]),
+  ];
+  const result = extractLlmSpanData(tags, logs);
+  assertEquals(result.outputMessages.length, 2, 'two separate output messages for two indices');
+  assertEquals(result.outputMessages[0].content, 'Choice A', 'index 0 content correct');
+  assertEquals(result.outputMessages[1].content, 'Choice B', 'index 1 content correct');
+});
+
+// ---------------------------------------------------------------------------
+// BUG-084: single-object content uses ?? instead of || (preserves falsy "0")
+// ---------------------------------------------------------------------------
+
+describe('BUG-084: single-object message content uses ?? (preserves 0 / false-y content)', () => {
+  const singleWithZeroContent = JSON.stringify({ role: 'assistant', content: 0 });
+  const tags: KeyValuePair[] = [
+    kv('operation.type', 'chat_completion'),
+    kv('input.value', singleWithZeroContent),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages.length, 1, 'message extracted');
+  assertEquals(result.inputMessages[0].content, '0', 'content "0" preserved (not replaced by text field)');
+});
+
+describe('BUG-084: single-object message with content="" uses ?? (empty string kept)', () => {
+  const singleWithEmpty = JSON.stringify({ role: 'assistant', content: '', text: 'fallback text' });
+  const tags: KeyValuePair[] = [
+    kv('operation.type', 'chat_completion'),
+    kv('input.value', singleWithEmpty),
+  ];
+  const result = extractLlmSpanData(tags, []);
+  assertEquals(result.inputMessages.length, 1, 'message extracted');
+  assertEquals(result.inputMessages[0].content, '', 'empty content kept with ??, not overridden by text');
+});
+
+// ---------------------------------------------------------------------------
+// Summary
+// ---------------------------------------------------------------------------
+
+console.log(`\n${'='.repeat(50)}`);
+console.log(`Results: ${passed} passed, ${failed} failed`);
+if (failed > 0) {
+  process.exit(1);
+}

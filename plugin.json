@@ -1,0 +1,40 @@
+{
+  "apiVersion": "v1",
+  "$schema": "https://raw.githubusercontent.com/grafana/grafana/main/docs/sources/developers/plugins/plugin.schema.json",
+  "type": "app",
+  "name": "LLM Traces",
+  "id": "llm-traces-app",
+  "info": {
+    "keywords": ["llm", "traces", "openinference", "observability", "genai", "otel"],
+    "description": "LLM trace visualization for OpenInference, OTel GenAI and Vertex AI spans stored in Grafana Tempo",
+    "author": { "name": "Agoda", "url": "https://github.com/agoda-com" },
+    "logos": { "small": "img/logo.svg", "large": "img/logo.svg" },
+    "screenshots": [
+      { "name": "LLM Traces", "path": "img/llm-traces-screenshot.png" }
+    ],
+    "version": "0.0.1",
+    "updated": "2026-04-06"
+  },
+  "includes": [
+    {
+      "type": "page",
+      "name": "LLM Traces",
+      "path": "/a/llm-traces-app",
+      "role": "Viewer",
+      "addToNav": true,
+      "defaultNav": true,
+      "icon": "ai-sparkle"
+    }
+  ],
+  "dependencies": {
+    "grafanaDependency": ">=11.1.0",
+    "plugins": [
+      {
+        "type": "datasource",
+        "id": "tempo",
+        "name": "Tempo",
+        "version": ">=0.1.0"
+      }
+    ]
+  }
+}
